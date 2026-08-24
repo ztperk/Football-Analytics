@@ -1,0 +1,309 @@
+---
+title: "ITCS5010_HW1"
+author: "Zach Perkins"
+Subtitle: "Professor Schuckers"
+format: html
+editor: visual
+
+---
+
+# Zachary Perkins (zperkin2@charlotte.edu) ITCS 5010 HW1
+Make sure the required R packages are installed:
+   - cfbfastR
+   - dplyr
+   - tidyr
+   - ggplot2
+
+## Homework 1  Due 8/24/26 7p
+
+For the assignment below, email to me a link to a github repository with working code that does the following things.  Be sure to tell me what file I am supposed to look at and how I am to run the code.
+
+
+### All students:
+
+1. (25 points) Complete the [CCI Learning Module on Academic Integrity](https://docs.google.com/document/d/1Xl04oF_QFLxusBlFhFX6mEx3xEdTi1dgKeu5uYyoHCg/edit?usp=sharing)
+by following the instruction at that link.  Email me your screenshot.
+# Emailed SS 
+
+2. (35 points) Find the three best **offensive**  metrics that you can for current P4 conference college football  using data from the 2021 - 2025 regular seasons.  Use a comparison that is the first part of the season to the second part of the season.  Clearly state your conclusions about which metrics are **best** measures to use for predictive analytics about teams and describe the other metrics that you tried.
+
+# Getting play by play data 
+```{r}
+library(cfbfastR)
+library(dplyr)
+```
+ 
+```{r}
+pbp_2021_2025 <- cfbfastR::load_cfb_pbp(2021:2025)
+
+dim(pbp_2021_2025)
+```
+
+# Filter
+```{r}
+p4_pbp <- pbp_2021_2025 |>
+  filter(offense_conference %in% c("ACC", "Big Ten", "Big 12", "SEC"))
+
+dim(p4_pbp)
+```
+
+```{r}
+p4_pbp_split <- p4_pbp |>
+  filter(season_type == "regular") |>
+  mutate(
+    season_half = case_when(
+      week <= 6 ~ "First Half",
+      week >= 7 ~ "Second Half"
+    )
+  )
+
+table(p4_pbp_split$season_half)
+```
+
+# Calculate different metrics 
+```{r}
+offense_metrics <- p4_pbp_split |>
+  filter(!is.na(offense_play)) |>
+  group_by(season, season_half, offense_play) |>
+  summarize(
+    plays = n(),
+    success_rate = mean(success, na.rm = TRUE),
+    yards_per_play = mean(yards_gained, na.rm = TRUE),
+    explosive_rate = mean(yards_gained >= 20, na.rm = TRUE),
+    turnover_rate = mean(turnover == 1, na.rm = TRUE),
+    third_down_conversion_rate =
+      sum(down == 3 & success == 1, na.rm = TRUE) /
+      sum(down == 3, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+head(offense_metrics)
+```
+
+# COmpare the metrics for first and second half
+```{r}
+offense_compare <- offense_metrics |>
+  select(
+    season,
+    offense_play,
+    season_half,
+    success_rate,
+    yards_per_play,
+    explosive_rate,
+    turnover_rate,
+    third_down_conversion_rate
+  ) |>
+  tidyr::pivot_wider(
+    names_from = season_half,
+    values_from = c(
+      success_rate,
+      yards_per_play,
+      explosive_rate,
+      turnover_rate,
+      third_down_conversion_rate
+    )
+  )
+
+head(offense_compare)
+```
+
+# See which metrics are strong indicators
+```{r}
+metric_correlations <- tibble(
+  metric = c(
+    "Success Rate",
+    "Yards Per Play",
+    "Explosive Rate",
+    "Turnover Rate",
+    "Third Down Conversion Rate"
+  ),
+  correlation = c(
+    cor(offense_compare$`success_rate_First Half`,
+        offense_compare$`success_rate_Second Half`,
+        use = "complete.obs"),
+
+    cor(offense_compare$`yards_per_play_First Half`,
+        offense_compare$`yards_per_play_Second Half`,
+        use = "complete.obs"),
+
+    cor(offense_compare$`explosive_rate_First Half`,
+        offense_compare$`explosive_rate_Second Half`,
+        use = "complete.obs"),
+
+    cor(offense_compare$`turnover_rate_First Half`,
+        offense_compare$`turnover_rate_Second Half`,
+        use = "complete.obs"),
+
+    cor(offense_compare$`third_down_conversion_rate_First Half`,
+        offense_compare$`third_down_conversion_rate_Second Half`,
+        use = "complete.obs")
+  )
+)
+
+metric_correlations |>
+  arrange(desc(correlation))
+```
+
+# Visualize the coorrelations 
+```{r}
+library(ggplot2)
+```
+
+```{r}
+ggplot(metric_correlations,
+       aes(x = reorder(metric, correlation), y = correlation)) +
+  geom_col(width = 0.7) +
+  geom_text(
+    aes(label = round(correlation, 3)),
+    hjust = -0.15,
+    size = 4
+  ) +
+  coord_flip() +
+  labs(
+    title = "Predictive Strength of Offensive Metrics",
+    x = NULL,
+    y = "First-Half vs. Second-Half Correlation"
+  ) +
+  ylim(0, 0.6) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+## Analysis 
+
+For the offensive metrics based on data from 2021-2025 regular season of P4 conference college football, I ran 5 different metrics and tesated which ones worked th best for predctive analytics. The calculations for each metric can be shown under the "calculate different metrics" code chunk. The top 3 metrics were Success Rate (0.515), Yards Per Play (0.505), and Explosive Rate (0.498).  These metrics appeared to be the best because they were more consistent from the first to the second half of the season. The other mettrics which were Turnover Rate (0.187) and Third Down Conversion Rate (0.187) were not as strong of indicators for predictive analytics because they were less consistent from the first to the second half of the season. Third down conversion rate likely was not as strong because it may be more dependent on the situation of the game and the score.  Turnover rate may not be as strong because they are more random and unpredictable. A chart can be shown under the "Visualize the correlations" code chunk to see how the correaltion stack up against eachother. 
+
+
+### ITCS 5010 Students:
+
+3. (20 points) Repeat the above on *defensive* metrics for the same seasons.
+
+# Filter
+```{r}
+p4_def_pbp <- pbp_2021_2025 |>
+  filter(defense_conference %in% c("ACC", "Big Ten", "Big 12", "SEC")) |>
+  filter(season_type == "regular") |>
+  mutate(
+    season_half = case_when(
+      week <= 6 ~ "First Half",
+      week >= 7 ~ "Second Half"
+    )
+  )
+
+dim(p4_def_pbp)
+```
+
+# Calculate defensinve metrics
+```{r}
+defense_metrics <- p4_def_pbp |>
+  filter(!is.na(defense_play)) |>
+  group_by(season, season_half, defense_play) |>
+  summarize(
+    plays = n(),
+    success_rate_allowed = mean(success, na.rm = TRUE),
+    yards_per_play_allowed = mean(yards_gained, na.rm = TRUE),
+    explosive_rate_allowed = mean(yards_gained >= 20, na.rm = TRUE),
+    turnover_forced_rate = mean(turnover == 1, na.rm = TRUE),
+    sack_rate = mean(sack == 1, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+head(defense_metrics)
+```
+
+# Comapre the metrics 
+```{r}
+defense_compare <- defense_metrics |>
+  select(
+    season,
+    defense_play,
+    season_half,
+    success_rate_allowed,
+    yards_per_play_allowed,
+    explosive_rate_allowed,
+    turnover_forced_rate,
+    sack_rate
+  ) |>
+  tidyr::pivot_wider(
+    names_from = season_half,
+    values_from = c(
+      success_rate_allowed,
+      yards_per_play_allowed,
+      explosive_rate_allowed,
+      turnover_forced_rate,
+      sack_rate
+    )
+  )
+
+head(defense_compare)
+```
+
+# See which defensive metrics are strong indicators
+```{r}
+defensive_correlations <- tibble(
+  metric = c(
+    "Success Rate Allowed",
+    "Yards Per Play Allowed",
+    "Explosive Rate Allowed",
+    "Turnover Forced Rate",
+    "Sack Rate"
+  ),
+  correlation = c(
+    cor(defense_compare$`success_rate_allowed_First Half`,
+        defense_compare$`success_rate_allowed_Second Half`,
+        use = "complete.obs"),
+
+    cor(defense_compare$`yards_per_play_allowed_First Half`,
+        defense_compare$`yards_per_play_allowed_Second Half`,
+        use = "complete.obs"),
+
+    cor(defense_compare$`explosive_rate_allowed_First Half`,
+        defense_compare$`explosive_rate_allowed_Second Half`,
+        use = "complete.obs"),
+
+    cor(defense_compare$`turnover_forced_rate_First Half`,
+        defense_compare$`turnover_forced_rate_Second Half`,
+        use = "complete.obs"),
+
+    cor(defense_compare$`sack_rate_First Half`,
+        defense_compare$`sack_rate_Second Half`,
+        use = "complete.obs")
+  )
+)
+
+defensive_correlations |>
+  arrange(desc(correlation))
+```
+
+# Visualize the defensive correlations
+```{r}
+ggplot(defensive_correlations,
+       aes(x = reorder(metric, correlation), y = correlation)) +
+  geom_col(width = 0.7) +
+  geom_text(
+    aes(label = round(correlation, 3)),
+    hjust = -0.15,
+    size = 4
+  ) +
+  coord_flip() +
+  labs(
+    title = "Predictive Strength of Defensive Metrics",
+    subtitle = "Correlation between first-half and second-half performance",
+    x = NULL,
+    y = "Correlation"
+  ) +
+  ylim(0, 0.5) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+## Analysis 
+For the defensive metrics based on data from 2021-2025 regular season of P4 conference college football, I ran 5 different metrics and tested which ones worked the best for predictive analytics. The calculations for each metric can be shown under the "calculate different metrics" code chunk. The top 3 metrics were Success Rate Allowed (0.452), Yards Per Play Allowed (0.308), and Explosive Rate Allowed (0.233). These defensive metrics are all similar to the offense metrics that were strong indicators as well. These correaltions are not as high as the correlations in comparison to the offensive metrics meaning it may be easier to predict offensive performance (or I need to find differente defenseive metrics). Sack Rate (0.229) and Turnover Forced Rate (0.160) were not strong indidciators. This suggest that a broader measure of success and yardage is more predictive than the more situational metrics like sacks and turnovers. You can see the chart under the "Visualize the defensive correlations" code chunk to see how the correlations stack up against each other. 
