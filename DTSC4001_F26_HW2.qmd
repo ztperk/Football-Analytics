@@ -1,0 +1,439 @@
+---
+title: "ITCS5010_HW1"
+author: "Zach Perkins"
+Subtitle: "Professor Schuckers"
+format: html
+editor: visual
+---
+
+# Zachary Perkins (zperkin2@charlotte.edu) ITCS 5010 HW1
+Make sure the required R packages are installed:
+   - cfbfastR
+   - dplyr
+   - tidyr
+   - ggplot2
+
+## Homework 2  Due 8/31/26 7p
+
+For the assignment below, email to me a link to a github repository with working code that does the following things.  Be sure to tell me what file I am supposed to look at and how I am to run the code.
+
+
+### All students:
+
+1. (25 points) Using data from college football seasons 2022 to 2025, filter to the games that are only FBS v FBS and make the plots from the Expected Points notebook from class using that data.  
+Explain in a paragraph the differences between the NFL model and the FBS-only model. 
+
+# Getting play by play Data 
+```{r}
+library(cfbfastR)
+library(dplyr)
+```
+
+```{r}
+cfb_2022_2025 <- load_cfb_pbp(2022:2025)
+```
+
+# Filter 
+```{r}
+#| label: filter-fbs-games
+
+cfb_fbs <- cfb_2022_2025 %>%
+  filter(
+    home_team_division == "fbs",
+    away_team_division == "fbs"
+  )
+```
+
+```{r}
+table(cfb_fbs$home_team_division, cfb_fbs$away_team_division)
+```
+
+```{r}
+#| label: filter-cfb-ep-data
+
+cfb_ep_filtered <- cfb_fbs %>%
+  filter(
+    !is.na(ep_before),
+    !is.na(pos_team),
+    !is.na(wp_before),
+    wp_before >= 0.05,
+    wp_before <= 0.95
+  )
+```
+
+# Create calibration model
+```{r}
+#| label: create-next-score
+
+cfb_next_score <- cfb_fbs %>%
+  arrange(game_id, half, game_play_number) %>%
+  group_by(game_id, half) %>%
+  mutate(
+    home_scoring_event = case_when(
+      touchdown == 1 & pos_team == home_team ~ 7,
+      touchdown == 1 & pos_team == away_team ~ -7,
+      fg_made == TRUE & pos_team == home_team ~ 3,
+      fg_made == TRUE & pos_team == away_team ~ -3,
+      safety == 1 & def_pos_team == home_team ~ 2,
+      safety == 1 & def_pos_team == away_team ~ -2,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  tidyr::fill(home_scoring_event, .direction = "up") %>%
+  mutate(
+    home_scoring_event = coalesce(home_scoring_event, 0),
+    pts_next_score = if_else(
+      pos_team == home_team,
+      home_scoring_event,
+      -home_scoring_event
+    )
+  ) %>%
+  ungroup()
+```
+
+```{r}
+#| label: cfb-calibration-data
+
+cfb_calibration <- cfb_next_score %>%
+  filter(
+    !is.na(ep_before),
+    !is.na(pts_next_score),
+    !is.na(wp_before),
+    wp_before >= 0.05,
+    wp_before <= 0.95
+  ) %>%
+  mutate(
+    ep_bin = round(ep_before * 2) / 2
+  ) %>%
+  group_by(ep_bin) %>%
+  summarize(
+    actual_pts = mean(pts_next_score),
+    plays = n(),
+    .groups = "drop"
+  ) %>%
+  filter(plays >= 50)
+```
+
+
+# Visualize 
+
+```{r}
+#| label: cfb-calibration-plot
+#| fig-width: 8
+#| fig-height: 6
+
+ggplot(cfb_calibration, aes(x = ep_bin, y = actual_pts)) +
+  geom_point(aes(size = plays), alpha = 0.7, color = "#013369") +
+  geom_abline(
+    slope = 1,
+    intercept = 0,
+    linetype = "dashed",
+    color = "#D50A0A",
+    linewidth = 1
+  ) +
+  scale_x_continuous(breaks = seq(-4, 7, 1)) +
+  scale_y_continuous(breaks = seq(-4, 7, 1)) +
+  labs(
+    title = "Expected Points Calibration: FBS vs. FBS",
+    subtitle = "College Football Seasons 2022-2025",
+    x = "Expected Points (Binned)",
+    y = "Average Actual Next Score",
+    size = "Number of Plays",
+    caption = "Data: cfbfastR"
+  ) +
+  theme_minimal()
+```
+
+# Analysis 
+
+The college football FBS model is similar to the NFL model beecuase the calibration points generally follow the same trend line. This means that the expected points model is close to the actual points scored on the next play. The main difference is that the FBS model has slightly more variability at the extreme ends of the expected points graph. I think that this is likely because of the large number of teams and different range of talent when comparing college football teams / players to the NFL. The NFL in general has a more consisten level of talent spread across the different teams. It is also important to note that there is muc more data in the college football model because the amount of teams. 
+
+
+2. (25 points)  In class we talked about the 3rd and X model.  Using data from the most recent 5 NFL seasons, fit the model described in class and in a well written paragraph evaluate the claim that ``all teams in the NFL are equally good at making 3rd and X.''  Explain any choices that you made regarding the data and the models.
+
+# Load Data
+
+```{r}
+nfl_2021_2025 <- load_pbp(2021:2025)
+```
+
+
+# Filters for third down plays
+
+```{r}
+third_downs <- nfl_2021_2025 %>%
+  filter(
+    season_type == "REG",
+    down == 3,
+    !is.na(ydstogo),
+    ydstogo < 15,
+    !is.na(wp),
+    wp >= 0.05,
+    wp <= 0.95
+  )
+```
+
+
+# Create target variable 
+
+```{r}
+third_downs <- third_downs %>%
+  mutate(
+    converted = if_else(
+      first_down == 1 |
+      touchdown == 1 |
+      first_down_penalty == 1,
+      1,
+      0
+    )
+  )
+```
+```{r}
+table(third_downs$converted)
+```
+
+
+# Baseline model 
+```{r}
+model_baseline <- glm(
+  converted ~ ydstogo,
+  data = third_downs,
+  family = binomial(link = "logit")
+)
+
+summary(model_baseline)
+```
+
+
+# Model with offensive team added 
+```{r}
+model_team <- glm(
+  converted ~ ydstogo + posteam,
+  data = third_downs,
+  family = binomial(link = "logit")
+)
+
+summary(model_team)
+```
+
+
+# Compare the models
+```{r}
+anova(
+  model_baseline,
+  model_team,
+  test = "Chisq"
+)
+```
+
+```{r}
+#| label: third-down-conversion-plot
+#| fig-width: 8
+#| fig-height: 6
+
+ggplot(third_downs, aes(x = ydstogo, y = converted)) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    size = 3
+  ) +
+  stat_smooth(
+    method = "glm",
+    method.args = list(family = "binomial"),
+    se = FALSE
+  ) +
+  scale_x_continuous(breaks = 1:14) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent
+  ) +
+  labs(
+    title = "NFL Third Down Conversion Probability",
+    subtitle = "2021-2025 Regular Seasons",
+    x = "Yards to Go on Third Down",
+    y = "Conversion Rate"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+team_grid <- tidyr::expand_grid(
+  ydstogo = 1:14,
+  posteam = sort(unique(third_downs$posteam))
+
+) %>%
+  mutate(
+    pred_team = predict(model_team, newdata = ., type = "response")
+  )
+
+baseline_grid <- tibble(
+  ydstogo = 1:14
+) %>%
+  mutate(
+    pred_baseline = predict(model_baseline, newdata = ., type = "response")
+  )
+
+ggplot() +
+  geom_line(
+    data = team_grid,
+    aes(x = ydstogo, y = pred_team, group = posteam),
+    alpha = 0.3,
+    color = "gray50"
+  ) +
+  geom_line(
+    data = baseline_grid,
+    aes(x = ydstogo, y = pred_baseline),
+    color = "blue",
+    linewidth = 1.5
+  ) +
+  scale_x_continuous(breaks = 1:14) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent
+  ) +
+  labs(
+    title = "NFL Third Down Conversion Probability by Team",
+    subtitle = "Gray lines = team-specific model predictions, blue line = overall baseline",
+    x = "Yards to Go on Third Down",
+    y = "Predicted Conversion Probability"
+  ) +
+  theme_minimal()
+```
+
+# Analysis 
+
+Using the NFL data from the 21-25 seasons, I modeled third-down conversion as a binary outcome using a logistic regression model. As we talked about in class, I filtered the model to third down plays with fewer than 15 yards to go, filtered out garbage time, and made to sure to include a score or penalties resulting in a first down as a conversion. The baseline model showed that "X" (yards to go) was a very strong indicator of whether a team would convert or not. The likelihood of converting decreased steadily as the distance increased. I then added the offensive team as a predictor to see if there were any differences between the teams. Adding the offensive team did improve the model, and the teams effect was stastically signifigant meaning teams are not exactly the same at converting on third and X. However, the improvement was very small and most individual teams were very close to the baseline model. This means that while teams do differ slightly, the "x" is by far the more important factor. Depending on how you want to look at it, you could say teams are not perfectly equal at converitng, but the difference is relatively small when you compare it to "x". 
+
+
+
+### ITCS 5010 Students:
+
+3. (20 points) Repeat \#2 above, using college football data.  Explain any choices that you made regarding the data and the models.  
+
+# Filter Data 
+
+```{r}
+cfb_third_downs <- cfb_2022_2025 %>%
+  filter(
+    home_team_division == "fbs",
+    away_team_division == "fbs",
+    season_type == "regular",
+    down == 3,
+    !is.na(distance),
+    distance < 15,
+    !is.na(wp_before),
+    wp_before >= 0.05,
+    wp_before <= 0.95
+  )
+```
+
+
+# Create taget variable 
+```{r}
+cfb_third_downs <- cfb_third_downs %>%
+  mutate(
+    converted = if_else(
+      yards_gained >= distance |
+      touchdown == 1 |
+      firstD_by_penalty == 1,
+      1,
+      0
+    )
+  )
+```
+
+```{r}
+table(cfb_third_downs$converted)
+```
+
+
+# Baseline model 
+```{r}
+#| label: cfb-baseline-logit
+
+cfb_model_baseline <- glm(
+  converted ~ distance,
+  data = cfb_third_downs,
+  family = binomial(link = "logit")
+)
+
+summary(cfb_model_baseline)
+```
+
+
+# Model with offensive team added
+
+```{r}
+cfb_model_team <- glm(
+  converted ~ distance + pos_team,
+  data = cfb_third_downs,
+  family = binomial(link = "logit")
+)
+
+summary(cfb_model_team)
+```
+
+# Compare the models
+```{r}
+#| label: compare-cfb-models
+
+anova(
+  cfb_model_baseline,
+  cfb_model_team,
+  test = "Chisq"
+)
+```
+
+
+# Visualization 
+```{r}
+#| label: cfb-team-comparison-plot
+#| fig-width: 9
+#| fig-height: 7
+
+cfb_team_grid <- tidyr::expand_grid(
+  distance = 1:14,
+  pos_team = sort(unique(cfb_third_downs$pos_team))
+) %>%
+  mutate(
+    pred_team = predict(cfb_model_team, newdata = ., type = "response")
+  )
+
+cfb_baseline_grid <- tibble(
+  distance = 1:14
+) %>%
+  mutate(
+    pred_baseline = predict(cfb_model_baseline, newdata = ., type = "response")
+  )
+
+ggplot() +
+  geom_line(
+    data = cfb_team_grid,
+    aes(x = distance, y = pred_team, group = pos_team),
+    alpha = 0.3,
+    color = "gray50"
+  ) +
+  geom_line(
+    data = cfb_baseline_grid,
+    aes(x = distance, y = pred_baseline),
+    color = "blue",
+    linewidth = 1.5
+  ) +
+  scale_x_continuous(breaks = 1:14) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    labels = scales::percent
+  ) +
+  labs(
+    title = "College Football Third Down Conversion Probability by Team",
+    subtitle = "Gray lines = team-specific model predictions, blue line = overall baseline",
+    x = "Yards to Go on Third Down",
+    y = "Predicted Conversion Probability"
+  ) +
+  theme_minimal()
+```
+
+
+# Analysis 
+
+Using college data (I chose FBS like in question #1) from 22-25, I used the same logistic regression approach withthe same filtering I did for the NFL model. As in the NFL model, distance was the strongest predictor of conversion probability, with the likelihood of converting decreases as distance increases. Adding in the offensvive team signifigantly improved the model, and the team effect showed more variation when comparing it to the NFL model. However, the overall improvement was still realtively small. This was expected again because of the large number of teams and range of talent in college football when comapring it to the NFL. Overall, while teams do differ in their ability to convert, the distance to go is by far the more importnat factor. Although, I think there is much more of a case to be made for college rather than NFL, and especially if you add in data that is not only FBS teams. 
