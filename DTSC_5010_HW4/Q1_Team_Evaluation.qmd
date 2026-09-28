@@ -1,0 +1,555 @@
+---
+title: "Homework 4 - Football Analytics"
+author: "Zach Perkins"
+format: 
+  html:
+    toc: true
+    theme: cosmo
+execute:
+  output: false
+  warning: false
+  message: false
+---
+
+
+
+# Question 1
+
+## Data Import & Preprocessing
+
+```{r}
+# Install required packages if missing:
+# install.packages(c("cfbfastR", "dplyr", "tidyr", "purrr", "knitr"))
+
+library(cfbfastR)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(knitr)
+```
+
+```{r}
+seasons <- 2021:2025
+
+raw_games <- load_cfb_schedules(seasons)
+```
+
+```{r}
+games_clean <- raw_games %>%
+  filter(
+    completed == TRUE,
+    !is.na(home_points),
+    !is.na(away_points),
+    home_division == "fbs",
+    away_division == "fbs",
+    season_type %in% c("regular")
+  ) %>%
+  select(
+    season,
+    week,
+    home_team,
+    away_team,
+    home_points,
+    away_points
+  ) %>%
+  arrange(season, week)
+```
+
+
+## SRS Model
+
+```{r}
+calc_srs_scratch <- function(df) {
+  teams <- unique(c(df$home_team, df$away_team))
+  n_games <- nrow(df)
+  
+  # Construct design matrix: Home (+1), Away (-1)
+  X <- matrix(0, nrow = n_games, ncol = length(teams))
+  colnames(X) <- teams
+  
+  for (i in seq_len(n_games)) {
+    X[i, df$home_team[i]] <- 1
+    X[i, df$away_team[i]] <- -1
+  }
+  
+  margin <- df$home_points - df$away_points
+  
+  # Intercept represents the home-team effect
+  fit <- lm(margin ~ 1 + X)
+  
+  coefs <- coef(fit)
+  
+  # Save home-team effect separately
+  home_effect <- unname(coefs["(Intercept)"])
+  
+  # Keep only team coefficients
+  srs_vec <- coefs[-1]
+  names(srs_vec) <- gsub("^X", "", names(srs_vec))
+  srs_vec[is.na(srs_vec)] <- 0
+  
+  # Center team ratings around zero
+  srs_centered <- srs_vec - mean(srs_vec, na.rm = TRUE)
+  
+  data.frame(
+    team = names(srs_centered),
+    season = df$season[1],
+    SRS = round(unname(srs_centered), 2),
+    home_effect = round(home_effect, 2),
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+```{r}
+srs_by_season <- games_clean %>%
+  group_split(season) %>%
+  map(calc_srs_scratch) %>%
+  bind_rows()
+```
+
+
+### Top and Bottom 10 SRS Teams by Season
+
+```{r}
+for (yr in sort(unique(srs_by_season$season))) {
+  cat("\n### Season:", yr, "\n\n")
+  
+  top_10 <- srs_by_season %>%
+    filter(season == yr) %>%
+    arrange(desc(SRS)) %>%
+    slice_head(n = 10) %>%
+    mutate(Rank = row_number()) %>%
+    select(
+      Rank,
+      Team = team,
+      `SRS Rating` = SRS
+    )
+  
+  bottom_10 <- srs_by_season %>%
+    filter(season == yr) %>%
+    arrange(SRS) %>%
+    slice_head(n = 10) %>%
+    mutate(Rank = row_number()) %>%
+    select(
+      Rank,
+      Team = team,
+      `SRS Rating` = SRS
+    )
+  
+  cat("\nTop 10\n\n")
+  print(
+    kable(
+      top_10,
+      format = "markdown",
+      align = c("c", "l", "r")
+    )
+  )
+  
+  cat("\n\nBottom 10\n\n")
+  print(
+    kable(
+      bottom_10,
+      format = "markdown",
+      align = c("c", "l", "r")
+    )
+  )
+  
+  cat("\n")
+}
+```
+
+
+## Opponent-Adjusted Game Control
+
+```{r}
+# Load college football play-by-play data
+pbp_raw <- load_cfb_pbp(seasons = 2021:2025)
+```
+
+
+```{r}
+# Filter play-by-play data and create full-game time remaining
+pbp_clean <- pbp_raw %>%
+  filter(
+    period %in% 1:4,
+    home_team_division == "fbs",
+    away_team_division == "fbs",
+    !is.na(clock_minutes),
+    !is.na(clock_seconds),
+    clock_minutes >= 0,
+    clock_minutes <= 15,
+    clock_seconds >= 0,
+    clock_seconds <= 59,
+    !is.na(score_diff),
+    !is.na(pos_team),
+    !is.na(home_team),
+    !is.na(away_team)
+  ) %>%
+  mutate(
+    # Convert quarter clock to regulation game seconds remaining
+    game_seconds_remaining =
+      (4 - period) * 900 +
+      (clock_minutes * 60) +
+      clock_seconds,
+    
+    # Convert score differential to the home team's perspective
+    home_lead = ifelse(
+      pos_team == home_team,
+      score_diff,
+      -score_diff
+    )
+  ) %>%
+  arrange(season, game_id, desc(game_seconds_remaining)) %>%
+  group_by(season, game_id) %>%
+  mutate(
+    play_duration =
+      lag(game_seconds_remaining, default = 3600) -
+      game_seconds_remaining,
+    
+    play_duration = ifelse(
+      play_duration < 0,
+      0,
+      play_duration
+    )
+  ) %>%
+  ungroup()
+```
+
+
+### Game Control Calculation
+
+```{r}
+# Calculate time-weighted score differential for each game
+game_control_by_game <- pbp_clean %>%
+  group_by(
+    season,
+    game_id,
+    home_team,
+    away_team
+  ) %>%
+  summarize(
+    total_time = sum(play_duration, na.rm = TRUE),
+    
+    home_gc =
+      sum(home_lead * play_duration, na.rm = TRUE) /
+      ifelse(total_time > 0, total_time, 1),
+    
+    away_gc = -home_gc,
+    
+    .groups = "drop"
+  )
+```
+
+
+```{r}
+# Remove games with incomplete play-by-play coverage
+game_control_by_game <- game_control_by_game %>%
+  filter(total_time >= 3000)
+```
+
+
+### Adjusted Game Control
+
+```{r}
+calc_adj_gc_scratch <- function(df) {
+  teams <- unique(c(df$home_team, df$away_team))
+  n_games <- nrow(df)
+  
+  # Construct design matrix: Home (+1), Away (-1)
+  X <- matrix(0, nrow = n_games, ncol = length(teams))
+  colnames(X) <- teams
+  
+  for (i in seq_len(n_games)) {
+    X[i, df$home_team[i]] <- 1
+    X[i, df$away_team[i]] <- -1
+  }
+  
+  # Home game control is the response variable
+  margin <- df$home_gc
+  
+  # Intercept represents the home-team effect
+  fit <- lm(margin ~ 1 + X)
+  
+  coefs <- coef(fit)
+  
+  # Save home-team effect separately
+  home_effect <- unname(coefs["(Intercept)"])
+  
+  # Keep only team coefficients
+  gc_vec <- coefs[-1]
+  names(gc_vec) <- gsub("^X", "", names(gc_vec))
+  gc_vec[is.na(gc_vec)] <- 0
+  
+  # Center team ratings around zero
+  gc_centered <- gc_vec - mean(gc_vec, na.rm = TRUE)
+  
+  data.frame(
+    team = names(gc_centered),
+    season = df$season[1],
+    Adj_GC = round(unname(gc_centered), 2),
+    home_effect = round(home_effect, 2),
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+
+```{r}
+adj_gc_by_season <- game_control_by_game %>%
+  group_split(season) %>%
+  map(calc_adj_gc_scratch) %>%
+  bind_rows()
+```
+
+
+### Top and Bottom 10 Adjusted Game Control Teams by Season
+
+```{r}
+for (yr in sort(unique(adj_gc_by_season$season))) {
+  cat("\n### Season:", yr, "\n\n")
+  
+  top_10 <- adj_gc_by_season %>%
+    filter(season == yr) %>%
+    arrange(desc(Adj_GC)) %>%
+    slice_head(n = 10) %>%
+    mutate(Rank = row_number()) %>%
+    select(
+      Rank,
+      Team = team,
+      `Adjusted Game Control` = Adj_GC
+    )
+  
+  bottom_10 <- adj_gc_by_season %>%
+    filter(season == yr) %>%
+    arrange(Adj_GC) %>%
+    slice_head(n = 10) %>%
+    mutate(Rank = row_number()) %>%
+    select(
+      Rank,
+      Team = team,
+      `Adjusted Game Control` = Adj_GC
+    )
+  
+  cat("\nTop 10\n\n")
+  print(
+    kable(
+      top_10,
+      format = "markdown",
+      align = c("c", "l", "r")
+    )
+  )
+  
+  cat("\n\nBottom 10\n\n")
+  print(
+    kable(
+      bottom_10,
+      format = "markdown",
+      align = c("c", "l", "r")
+    )
+  )
+  
+  cat("\n")
+}
+```
+
+
+### Average Win Probability Calculation
+
+```{r}
+# Calculate average win probability for each team in each game
+awp_by_game <- pbp_raw %>%
+  filter(
+    period %in% 1:4,
+    home_team_division == "fbs",
+    away_team_division == "fbs",
+    !is.na(home_wp_before),
+    !is.na(away_wp_before),
+    !is.na(home_team),
+    !is.na(away_team)
+  ) %>%
+  group_by(
+    season,
+    game_id,
+    home_team,
+    away_team
+  ) %>%
+  summarize(
+    home_awp = mean(home_wp_before, na.rm = TRUE),
+    away_awp = mean(away_wp_before, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+
+### Season Average Win Probability
+
+```{r}
+# Reshape game-level AWP into one row per team per game
+awp_team_games <- bind_rows(
+  awp_by_game %>%
+    select(
+      season,
+      game_id,
+      team = home_team,
+      awp = home_awp
+    ),
+  
+  awp_by_game %>%
+    select(
+      season,
+      game_id,
+      team = away_team,
+      awp = away_awp
+    )
+)
+
+# Calculate unadjusted average win probability by season
+season_awp <- awp_team_games %>%
+  group_by(season, team) %>%
+  summarize(
+    games_played = n(),
+    avg_wp = mean(awp, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(season, desc(avg_wp))
+```
+
+### Adjusted Average Win Probability
+
+```{r}
+calc_adj_awp_scratch <- function(df) {
+  teams <- unique(c(df$home_team, df$away_team))
+  n_games <- nrow(df)
+  
+  # Construct design matrix: Home (+1), Away (-1)
+  X <- matrix(0, nrow = n_games, ncol = length(teams))
+  colnames(X) <- teams
+  
+  for (i in seq_len(n_games)) {
+    X[i, df$home_team[i]] <- 1
+    X[i, df$away_team[i]] <- -1
+  }
+  
+  # Home team's average win probability is the response
+  awp <- df$home_awp
+  
+  # Intercept represents the home-team effect
+  fit <- lm(awp ~ 1 + X)
+  
+  coefs <- coef(fit)
+  
+  # Save home-team effect separately
+  home_effect <- unname(coefs["(Intercept)"])
+  
+  # Keep only team coefficients
+  awp_vec <- coefs[-1]
+  names(awp_vec) <- gsub("^X", "", names(awp_vec))
+  awp_vec[is.na(awp_vec)] <- 0
+  
+  # Center team ratings around zero
+  awp_centered <- awp_vec - mean(awp_vec, na.rm = TRUE)
+  
+  data.frame(
+    team = names(awp_centered),
+    season = df$season[1],
+    Adj_AWP = round(unname(awp_centered), 4),
+    home_effect = round(home_effect, 4),
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+```{r}
+adj_awp_by_season <- awp_by_game %>%
+  group_split(season) %>%
+  map(calc_adj_awp_scratch) %>%
+  bind_rows()
+```
+
+
+### Top and Bottom 10 Adjusted AWP Teams by Season
+
+```{r}
+for (yr in sort(unique(adj_awp_by_season$season))) {
+  cat("\n### Season:", yr, "\n\n")
+  
+  top_10 <- adj_awp_by_season %>%
+    filter(season == yr) %>%
+    arrange(desc(Adj_AWP)) %>%
+    slice_head(n = 10) %>%
+    mutate(Rank = row_number()) %>%
+    select(
+      Rank,
+      Team = team,
+      `Adjusted AWP` = Adj_AWP
+    )
+  
+  bottom_10 <- adj_awp_by_season %>%
+    filter(season == yr) %>%
+    arrange(Adj_AWP) %>%
+    slice_head(n = 10) %>%
+    mutate(Rank = row_number()) %>%
+    select(
+      Rank,
+      Team = team,
+      `Adjusted AWP` = Adj_AWP
+    )
+  
+  cat("\nTop 10\n\n")
+  
+  print(
+    kable(
+      top_10,
+      format = "markdown",
+      align = c("c", "l", "r")
+    )
+  )
+  
+  cat("\n\nBottom 10\n\n")
+  
+  print(
+    kable(
+      bottom_10,
+      format = "markdown",
+      align = c("c", "l", "r")
+    )
+  )
+  
+  cat("\n")
+}
+```
+
+
+### Season Average Game Control
+
+```{r}
+# Reshape game-level Game Control into one row per team per game
+gc_team_games <- bind_rows(
+  game_control_by_game %>%
+    select(
+      season,
+      game_id,
+      team = home_team,
+      game_control = home_gc
+    ),
+  
+  game_control_by_game %>%
+    select(
+      season,
+      game_id,
+      team = away_team,
+      game_control = away_gc
+    )
+)
+
+# Calculate unadjusted average Game Control by season
+season_game_control <- gc_team_games %>%
+  group_by(season, team) %>%
+  summarize(
+    games_played = n(),
+    avg_game_control = mean(game_control, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(season, desc(avg_game_control))
+```
+

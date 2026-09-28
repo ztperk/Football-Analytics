@@ -1,0 +1,450 @@
+---
+title: "Homework 4 - Question 3"
+author: "Zach Perkins"
+format:
+  html:
+    toc: true
+    theme: cosmo
+execute:
+  output: false
+  warning: false
+  message: false
+---
+
+# Question 3 - Repeatability
+
+## Data Import & Preprocessing
+
+```{r}
+# Install required packages if missing:
+# install.packages(c("cfbfastR", "dplyr", "tidyr", "purrr", "knitr"))
+
+library(cfbfastR)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(knitr)
+
+seasons <- 2021:2025
+
+raw_games <- load_cfb_schedules(seasons)
+
+games_clean <- raw_games %>%
+  filter(
+    completed == TRUE,
+    !is.na(home_points),
+    !is.na(away_points),
+    home_division == "fbs",
+    away_division == "fbs",
+    season_type %in% c("regular")
+  ) %>%
+  select(
+    season,
+    week,
+    home_team,
+    away_team,
+    home_points,
+    away_points
+  ) %>%
+  arrange(season, week)
+```
+
+
+## Early and Late Season Split
+```{r}
+early_games <- games_clean %>%
+  filter(week <= 8)
+
+late_games <- games_clean %>%
+  filter(week > 8)
+```
+
+
+## SRS Repeatability
+
+```{r}
+calc_srs_repeat <- function(df) {
+  teams <- unique(c(df$home_team, df$away_team))
+  n_games <- nrow(df)
+  
+  X <- matrix(0, nrow = n_games, ncol = length(teams))
+  colnames(X) <- teams
+  
+  for (i in seq_len(n_games)) {
+    X[i, df$home_team[i]] <- 1
+    X[i, df$away_team[i]] <- -1
+  }
+  
+  margin <- df$home_points - df$away_points
+  
+  fit <- lm(margin ~ 1 + X)
+  
+  coefs <- coef(fit)
+  
+  srs_vec <- coefs[-1]
+  names(srs_vec) <- gsub("^X", "", names(srs_vec))
+  srs_vec[is.na(srs_vec)] <- 0
+  
+  srs_centered <- srs_vec - mean(srs_vec, na.rm = TRUE)
+  
+  data.frame(
+    team = names(srs_centered),
+    season = df$season[1],
+    SRS = unname(srs_centered),
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+```{r}
+srs_early <- early_games %>%
+  group_split(season) %>%
+  map(calc_srs_repeat) %>%
+  bind_rows()
+
+srs_late <- late_games %>%
+  group_split(season) %>%
+  map(calc_srs_repeat) %>%
+  bind_rows()
+```
+
+
+### SRS Repeatability Correlation
+
+```{r}
+srs_repeatability <- srs_early %>%
+  rename(
+    SRS_early = SRS
+  ) %>%
+  inner_join(
+    srs_late %>%
+      rename(
+        SRS_late = SRS
+      ),
+    by = c("season", "team")
+  )
+
+srs_repeatability_by_season <- srs_repeatability %>%
+  group_by(season) %>%
+  summarize(
+    correlation = cor(SRS_early, SRS_late, use = "complete.obs"),
+    .groups = "drop"
+  )
+
+srs_repeatability_by_season
+```
+
+
+
+## Adjusted Game Control Repeatability
+
+```{r}
+# Load college football play-by-play data
+pbp_raw <- load_cfb_pbp(seasons = 2021:2025)
+
+# Prepare play-by-play data
+pbp_clean <- pbp_raw %>%
+  filter(
+    season_type == "regular",
+    period %in% 1:4,
+    home_team_division == "fbs",
+    away_team_division == "fbs",
+    !is.na(clock_minutes),
+    !is.na(clock_seconds),
+    clock_minutes >= 0,
+    clock_minutes <= 15,
+    clock_seconds >= 0,
+    clock_seconds <= 59,
+    !is.na(score_diff),
+    !is.na(pos_team),
+    !is.na(home_team),
+    !is.na(away_team)
+  ) %>%
+  mutate(
+    game_seconds_remaining =
+      (4 - period) * 900 +
+      (clock_minutes * 60) +
+      clock_seconds,
+    
+    home_lead = ifelse(
+      pos_team == home_team,
+      score_diff,
+      -score_diff
+    )
+  ) %>%
+  arrange(season, game_id, desc(game_seconds_remaining)) %>%
+  group_by(season, game_id) %>%
+  mutate(
+    play_duration =
+      lag(game_seconds_remaining, default = 3600) -
+      game_seconds_remaining,
+    
+    play_duration = ifelse(
+      play_duration < 0,
+      0,
+      play_duration
+    )
+  ) %>%
+  ungroup()
+
+# Calculate Game Control by game
+game_control_by_game <- pbp_clean %>%
+  group_by(
+    season,
+    week,
+    game_id,
+    home_team,
+    away_team
+  ) %>%
+  summarize(
+    total_time = sum(play_duration, na.rm = TRUE),
+    home_gc =
+      sum(home_lead * play_duration, na.rm = TRUE) /
+      ifelse(total_time > 0, total_time, 1),
+    away_gc = -home_gc,
+    .groups = "drop"
+  ) %>%
+  filter(total_time >= 3000)
+```
+
+```{r}
+gc_early_games <- game_control_by_game %>%
+  filter(week <= 8)
+
+gc_late_games <- game_control_by_game %>%
+  filter(week > 8)
+```
+
+```{r}
+calc_gc_repeat <- function(df) {
+  teams <- unique(c(df$home_team, df$away_team))
+  n_games <- nrow(df)
+  
+  X <- matrix(0, nrow = n_games, ncol = length(teams))
+  colnames(X) <- teams
+  
+  for (i in seq_len(n_games)) {
+    X[i, df$home_team[i]] <- 1
+    X[i, df$away_team[i]] <- -1
+  }
+  
+  fit <- lm(df$home_gc ~ 1 + X)
+  
+  coefs <- coef(fit)
+  
+  gc_vec <- coefs[-1]
+  names(gc_vec) <- gsub("^X", "", names(gc_vec))
+  gc_vec[is.na(gc_vec)] <- 0
+  
+  gc_centered <- gc_vec - mean(gc_vec, na.rm = TRUE)
+  
+  data.frame(
+    team = names(gc_centered),
+    season = df$season[1],
+    Adj_GC = unname(gc_centered),
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+```{r}
+gc_early <- gc_early_games %>%
+  group_split(season) %>%
+  map(calc_gc_repeat) %>%
+  bind_rows()
+
+gc_late <- gc_late_games %>%
+  group_split(season) %>%
+  map(calc_gc_repeat) %>%
+  bind_rows()
+```
+
+
+
+### Adjusted Game Control Repeatability Correlation
+
+```{r}
+gc_repeatability <- gc_early %>%
+  rename(
+    Adj_GC_early = Adj_GC
+  ) %>%
+  inner_join(
+    gc_late %>%
+      rename(
+        Adj_GC_late = Adj_GC
+      ),
+    by = c("season", "team")
+  )
+
+gc_repeatability_by_season <- gc_repeatability %>%
+  group_by(season) %>%
+  summarize(
+    correlation = cor(
+      Adj_GC_early,
+      Adj_GC_late,
+      use = "complete.obs"
+    ),
+    .groups = "drop"
+  )
+
+gc_repeatability_by_season
+```
+
+
+## Adjusted AWP Repeatability
+
+```{r}
+# Calculate average win probability for each game
+awp_by_game <- pbp_raw %>%
+  filter(
+    season_type == "regular",
+    period %in% 1:4,
+    home_team_division == "fbs",
+    away_team_division == "fbs",
+    !is.na(home_wp_before),
+    !is.na(away_wp_before),
+    !is.na(home_team),
+    !is.na(away_team)
+  ) %>%
+  group_by(
+    season,
+    week,
+    game_id,
+    home_team,
+    away_team
+  ) %>%
+  summarize(
+    home_awp = mean(home_wp_before, na.rm = TRUE),
+    away_awp = mean(away_wp_before, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+awp_early_games <- awp_by_game %>%
+  filter(week <= 8)
+
+awp_late_games <- awp_by_game %>%
+  filter(week > 8)
+```
+
+```{r}
+calc_awp_repeat <- function(df) {
+  teams <- unique(c(df$home_team, df$away_team))
+  n_games <- nrow(df)
+  
+  X <- matrix(0, nrow = n_games, ncol = length(teams))
+  colnames(X) <- teams
+  
+  for (i in seq_len(n_games)) {
+    X[i, df$home_team[i]] <- 1
+    X[i, df$away_team[i]] <- -1
+  }
+  
+  fit <- lm(df$home_awp ~ 1 + X)
+  
+  coefs <- coef(fit)
+  
+  awp_vec <- coefs[-1]
+  names(awp_vec) <- gsub("^X", "", names(awp_vec))
+  awp_vec[is.na(awp_vec)] <- 0
+  
+  awp_centered <- awp_vec - mean(awp_vec, na.rm = TRUE)
+  
+  data.frame(
+    team = names(awp_centered),
+    season = df$season[1],
+    Adj_AWP = unname(awp_centered),
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+```{r}
+awp_early <- awp_early_games %>%
+  group_split(season) %>%
+  map(calc_awp_repeat) %>%
+  bind_rows()
+
+awp_late <- awp_late_games %>%
+  group_split(season) %>%
+  map(calc_awp_repeat) %>%
+  bind_rows()
+```
+
+
+### Adjusted AWP Repeatability Correlation
+
+```{r}
+awp_repeatability <- awp_early %>%
+  rename(
+    Adj_AWP_early = Adj_AWP
+  ) %>%
+  inner_join(
+    awp_late %>%
+      rename(
+        Adj_AWP_late = Adj_AWP
+      ),
+    by = c("season", "team")
+  )
+
+awp_repeatability_by_season <- awp_repeatability %>%
+  group_by(season) %>%
+  summarize(
+    correlation = cor(
+      Adj_AWP_early,
+      Adj_AWP_late,
+      use = "complete.obs"
+    ),
+    .groups = "drop"
+  )
+
+awp_repeatability_by_season
+```
+
+
+
+## Model Comparison
+
+```{r}
+repeatability_comparison <- tibble(
+  Model = c(
+    "SRS",
+    "Adjusted Game Control",
+    "Adjusted AWP"
+  ),
+  Correlation = c(
+    cor(
+      srs_repeatability$SRS_early,
+      srs_repeatability$SRS_late,
+      use = "complete.obs"
+    ),
+    cor(
+      gc_repeatability$Adj_GC_early,
+      gc_repeatability$Adj_GC_late,
+      use = "complete.obs"
+    ),
+    cor(
+      awp_repeatability$Adj_AWP_early,
+      awp_repeatability$Adj_AWP_late,
+      use = "complete.obs"
+    )
+  )
+) %>%
+  mutate(
+    Correlation = round(Correlation, 3)
+  ) %>%
+  arrange(desc(Correlation))
+
+kable(
+  repeatability_comparison,
+  format = "markdown",
+  col.names = c("Model", "Correlation"),
+  align = c("l", "r")
+)
+```
+
+
+### Conclusion
+
+I found that the SRS model had the best repeatability, the  overall correlation was about 0.511 between the early and late season ratings. Adjusted Game Control had a worse correlation of about 0.345, lastly, adjusted AWP had a correlation of about 0.336.
+
+I split each season into Weeks 1 through 8 and Weeks 9 until the end of the regular season. I chose this split so I could have two separate parts of the same season with enough games in each group to build team ratings. Comparing the ratings from the two parts shows how consistent each model is when using different sets of games.

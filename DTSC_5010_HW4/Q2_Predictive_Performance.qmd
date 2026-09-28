@@ -1,0 +1,537 @@
+---
+title: "Homework 4 - Question 2"
+author: "Zach Perkins"
+format:
+  html:
+    toc: true
+    theme: cosmo
+execute:
+  output: false
+  warning: false
+  message: false
+---
+
+# Question 2 - Out-of-Sample Predictive Performance
+
+## Data Import & Preprocessing
+
+```{r}
+# Install required packages if missing:
+# install.packages(c("cfbfastR", "dplyr", "tidyr", "purrr", "knitr"))
+
+library(cfbfastR)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(knitr)
+
+seasons <- 2021:2025
+
+raw_games <- load_cfb_schedules(seasons)
+
+games_clean <- raw_games %>%
+  filter(
+    completed == TRUE,
+    !is.na(home_points),
+    !is.na(away_points),
+    home_division == "fbs",
+    away_division == "fbs",
+    season_type %in% c("regular")
+  ) %>%
+  select(
+    season,
+    week,
+    home_team,
+    away_team,
+    home_points,
+    away_points
+  ) %>%
+  arrange(season, week)
+```
+
+```{r}
+train_games <- games_clean %>%
+  filter(week <= 10)
+
+test_games <- games_clean %>%
+  filter(week > 10)
+```
+
+
+## SRS Training Model
+
+```{r}
+calc_srs_train <- function(df) {
+  teams <- unique(c(df$home_team, df$away_team))
+  n_games <- nrow(df)
+  
+  # Construct design matrix: Home (+1), Away (-1)
+  X <- matrix(0, nrow = n_games, ncol = length(teams))
+  colnames(X) <- teams
+  
+  for (i in seq_len(n_games)) {
+    X[i, df$home_team[i]] <- 1
+    X[i, df$away_team[i]] <- -1
+  }
+  
+  margin <- df$home_points - df$away_points
+  
+  # Include a home-team effect
+  fit <- lm(margin ~ 1 + X)
+  
+  coefs <- coef(fit)
+  
+  home_effect <- unname(coefs["(Intercept)"])
+  
+  srs_vec <- coefs[-1]
+  names(srs_vec) <- gsub("^X", "", names(srs_vec))
+  srs_vec[is.na(srs_vec)] <- 0
+  
+  srs_centered <- srs_vec - mean(srs_vec, na.rm = TRUE)
+  
+  data.frame(
+    team = names(srs_centered),
+    season = df$season[1],
+    SRS = unname(srs_centered),
+    home_effect = home_effect,
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+```{r}
+srs_train_ratings <- train_games %>%
+  group_split(season) %>%
+  map(calc_srs_train) %>%
+  bind_rows()
+```
+
+### SRS Test Predictions
+
+```{r}
+srs_test_predictions <- test_games %>%
+  left_join(
+    srs_train_ratings %>%
+      select(
+        season,
+        home_team = team,
+        home_srs = SRS,
+        home_effect
+      ),
+    by = c("season", "home_team")
+  ) %>%
+  left_join(
+    srs_train_ratings %>%
+      select(
+        season,
+        away_team = team,
+        away_srs = SRS
+      ),
+    by = c("season", "away_team")
+  ) %>%
+  mutate(
+    predicted_margin = home_effect + home_srs - away_srs,
+    actual_margin = home_points - away_points
+  )
+```
+
+
+### SRS Out-of-Sample Accuracy
+
+```{r}
+srs_accuracy <- srs_test_predictions %>%
+  mutate(
+    predicted_home_win = predicted_margin > 0,
+    actual_home_win = actual_margin > 0,
+    correct_prediction = predicted_home_win == actual_home_win
+  ) %>%
+  group_by(season) %>%
+  summarize(
+    games = n(),
+    correct = sum(correct_prediction),
+    accuracy = mean(correct_prediction),
+    .groups = "drop"
+  )
+
+srs_accuracy
+```
+
+
+
+## Game Control Training Model
+
+```{r}
+# Load college football play-by-play data
+pbp_raw <- load_cfb_pbp(seasons = 2021:2025)
+
+# Filter and prepare play-by-play data
+pbp_clean <- pbp_raw %>%
+  filter(
+    season_type == "regular",
+    period %in% 1:4,
+    home_team_division == "fbs",
+    away_team_division == "fbs",
+    !is.na(clock_minutes),
+    !is.na(clock_seconds),
+    clock_minutes >= 0,
+    clock_minutes <= 15,
+    clock_seconds >= 0,
+    clock_seconds <= 59,
+    !is.na(score_diff),
+    !is.na(pos_team),
+    !is.na(home_team),
+    !is.na(away_team)
+  ) %>%
+  mutate(
+    game_seconds_remaining =
+      (4 - period) * 900 +
+      (clock_minutes * 60) +
+      clock_seconds,
+    
+    home_lead = ifelse(
+      pos_team == home_team,
+      score_diff,
+      -score_diff
+    )
+  ) %>%
+  arrange(season, game_id, desc(game_seconds_remaining)) %>%
+  group_by(season, game_id) %>%
+  mutate(
+    play_duration =
+      lag(game_seconds_remaining, default = 3600) -
+      game_seconds_remaining,
+    
+    play_duration = ifelse(
+      play_duration < 0,
+      0,
+      play_duration
+    )
+  ) %>%
+  ungroup()
+
+# Calculate Game Control for each game
+game_control_by_game <- pbp_clean %>%
+  group_by(
+    season,
+    week,
+    game_id,
+    home_team,
+    away_team
+  ) %>%
+  summarize(
+    total_time = sum(play_duration, na.rm = TRUE),
+    home_gc =
+      sum(home_lead * play_duration, na.rm = TRUE) /
+      ifelse(total_time > 0, total_time, 1),
+    away_gc = -home_gc,
+    .groups = "drop"
+  ) %>%
+  filter(total_time >= 3000)
+```
+
+```{r}
+gc_train_games <- game_control_by_game %>%
+  filter(week <= 10)
+
+gc_test_games <- game_control_by_game %>%
+  filter(week > 10)
+```
+
+```{r}
+calc_gc_train <- function(df) {
+  teams <- unique(c(df$home_team, df$away_team))
+  n_games <- nrow(df)
+  
+  # Construct design matrix: Home (+1), Away (-1)
+  X <- matrix(0, nrow = n_games, ncol = length(teams))
+  colnames(X) <- teams
+  
+  for (i in seq_len(n_games)) {
+    X[i, df$home_team[i]] <- 1
+    X[i, df$away_team[i]] <- -1
+  }
+  
+  # Home Game Control is the response
+  fit <- lm(df$home_gc ~ 1 + X)
+  
+  coefs <- coef(fit)
+  
+  home_effect <- unname(coefs["(Intercept)"])
+  
+  gc_vec <- coefs[-1]
+  names(gc_vec) <- gsub("^X", "", names(gc_vec))
+  gc_vec[is.na(gc_vec)] <- 0
+  
+  gc_centered <- gc_vec - mean(gc_vec, na.rm = TRUE)
+  
+  data.frame(
+    team = names(gc_centered),
+    season = df$season[1],
+    Adj_GC = unname(gc_centered),
+    home_effect = home_effect,
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+```{r}
+gc_train_ratings <- gc_train_games %>%
+  group_split(season) %>%
+  map(calc_gc_train) %>%
+  bind_rows()
+```
+
+
+### Game Control Test Predictions
+
+```{r}
+gc_test_predictions <- gc_test_games %>%
+  left_join(
+    gc_train_ratings %>%
+      select(
+        season,
+        home_team = team,
+        home_gc_rating = Adj_GC,
+        home_effect
+      ),
+    by = c("season", "home_team")
+  ) %>%
+  left_join(
+    gc_train_ratings %>%
+      select(
+        season,
+        away_team = team,
+        away_gc_rating = Adj_GC
+      ),
+    by = c("season", "away_team")
+  ) %>%
+  mutate(
+    predicted_gc = home_effect + home_gc_rating - away_gc_rating,
+    predicted_home_win = predicted_gc > 0
+  )
+```
+
+### Game Control Out-of-Sample Accuracy
+
+```{r}
+gc_accuracy_data <- gc_test_predictions %>%
+  left_join(
+    test_games %>%
+      select(
+        season,
+        week,
+        home_team,
+        away_team,
+        home_points,
+        away_points
+      ),
+    by = c(
+      "season",
+      "week",
+      "home_team",
+      "away_team"
+    )
+  ) %>%
+  mutate(
+    actual_home_win = home_points > away_points,
+    correct_prediction = predicted_home_win == actual_home_win
+  )
+
+gc_accuracy <- gc_accuracy_data %>%
+  group_by(season) %>%
+  summarize(
+    games = n(),
+    correct = sum(correct_prediction),
+    accuracy = mean(correct_prediction),
+    .groups = "drop"
+  )
+
+gc_accuracy
+```
+
+
+
+## AWP Training Model
+
+```{r}
+# Calculate average win probability for each game
+awp_by_game <- pbp_raw %>%
+  filter(
+    season_type == "regular",
+    period %in% 1:4,
+    home_team_division == "fbs",
+    away_team_division == "fbs",
+    !is.na(home_wp_before),
+    !is.na(away_wp_before),
+    !is.na(home_team),
+    !is.na(away_team)
+  ) %>%
+  group_by(
+    season,
+    week,
+    game_id,
+    home_team,
+    away_team
+  ) %>%
+  summarize(
+    home_awp = mean(home_wp_before, na.rm = TRUE),
+    away_awp = mean(away_wp_before, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+awp_train_games <- awp_by_game %>%
+  filter(week <= 10)
+
+awp_test_games <- awp_by_game %>%
+  filter(week > 10)
+```
+
+```{r}
+calc_awp_train <- function(df) {
+  teams <- unique(c(df$home_team, df$away_team))
+  n_games <- nrow(df)
+  
+  # Construct design matrix: Home (+1), Away (-1)
+  X <- matrix(0, nrow = n_games, ncol = length(teams))
+  colnames(X) <- teams
+  
+  for (i in seq_len(n_games)) {
+    X[i, df$home_team[i]] <- 1
+    X[i, df$away_team[i]] <- -1
+  }
+  
+  # Home team's average win probability is the response
+  fit <- lm(df$home_awp ~ 1 + X)
+  
+  coefs <- coef(fit)
+  
+  home_effect <- unname(coefs["(Intercept)"])
+  
+  awp_vec <- coefs[-1]
+  names(awp_vec) <- gsub("^X", "", names(awp_vec))
+  awp_vec[is.na(awp_vec)] <- 0
+  
+  awp_centered <- awp_vec - mean(awp_vec, na.rm = TRUE)
+  
+  data.frame(
+    team = names(awp_centered),
+    season = df$season[1],
+    Adj_AWP = unname(awp_centered),
+    home_effect = home_effect,
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+```{r}
+awp_train_ratings <- awp_train_games %>%
+  group_split(season) %>%
+  map(calc_awp_train) %>%
+  bind_rows()
+```
+
+### AWP Test Predictions
+
+```{r}
+awp_test_predictions <- awp_test_games %>%
+  left_join(
+    awp_train_ratings %>%
+      select(
+        season,
+        home_team = team,
+        home_awp_rating = Adj_AWP,
+        home_effect
+      ),
+    by = c("season", "home_team")
+  ) %>%
+  left_join(
+    awp_train_ratings %>%
+      select(
+        season,
+        away_team = team,
+        away_awp_rating = Adj_AWP
+      ),
+    by = c("season", "away_team")
+  ) %>%
+  mutate(
+    predicted_awp = home_effect + home_awp_rating - away_awp_rating,
+    predicted_home_win = predicted_awp > 0.5
+  )
+```
+
+### AWP Out-of-Sample Accuracy
+
+```{r}
+awp_accuracy_data <- awp_test_predictions %>%
+  left_join(
+    test_games %>%
+      select(
+        season,
+        week,
+        home_team,
+        away_team,
+        home_points,
+        away_points
+      ),
+    by = c(
+      "season",
+      "week",
+      "home_team",
+      "away_team"
+    )
+  ) %>%
+  mutate(
+    actual_home_win = home_points > away_points,
+    correct_prediction = predicted_home_win == actual_home_win
+  )
+
+awp_accuracy <- awp_accuracy_data %>%
+  group_by(season) %>%
+  summarize(
+    games = n(),
+    correct = sum(correct_prediction),
+    accuracy = mean(correct_prediction),
+    .groups = "drop"
+  )
+
+awp_accuracy
+```
+
+
+## Model Comparison
+
+```{r}
+model_comparison <- tibble(
+  Model = c(
+    "SRS",
+    "Adjusted Game Control",
+    "Adjusted AWP"
+  ),
+  Accuracy = c(
+    mean(
+      (srs_test_predictions$predicted_margin > 0) ==
+      (srs_test_predictions$actual_margin > 0)
+    ),
+    mean(gc_accuracy_data$correct_prediction),
+    mean(awp_accuracy_data$correct_prediction)
+  )
+) %>%
+  mutate(
+    Accuracy = round(Accuracy, 3)
+  ) %>%
+  arrange(desc(Accuracy))
+
+kable(
+  model_comparison,
+  format = "markdown",
+  col.names = c("Model", "Accuracy"),
+  align = c("l", "r")
+)
+```
+
+
+### Conclusion
+
+I found that the SRS model had the best out-of-sample performance, with an  accuracy of  72.4%. The adjusted Game Control model was a close second at about 71.9% accuracy, and the adjusted AWP model followed with an accuracy of about 70.7%.
+
+I chose to train the models on Weeks 1 through 10 of each season and test them on the remaining regular-season games. I chose this split because it gives each model enough early-season games to build team ratings before testing how well those ratings predict later games. It also keeps the training games before the test games, which is more realistic than randomly mixing games from the entire season.

@@ -1,0 +1,375 @@
+---
+title: "Homework 4 - Question 4"
+author: "Zach Perkins"
+format:
+  html:
+    toc: true
+    theme: cosmo
+execute:
+  output: false
+  warning: false
+  message: false
+---
+
+# Question 4 - Adjusted vs. Unadjusted Ratings
+
+## Data Import & Preprocessing
+
+```{r}
+# Install required packages if missing:
+# install.packages(c("cfbfastR", "dplyr", "tidyr", "purrr", "knitr"))
+
+library(cfbfastR)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(knitr)
+
+seasons <- 2021:2025
+```
+
+## Game Control
+
+```{r}
+pbp_raw <- load_cfb_pbp(seasons = 2021:2025)
+
+pbp_clean <- pbp_raw %>%
+  filter(
+    season_type == "regular",
+    period %in% 1:4,
+    home_team_division == "fbs",
+    away_team_division == "fbs",
+    !is.na(clock_minutes),
+    !is.na(clock_seconds),
+    clock_minutes >= 0,
+    clock_minutes <= 15,
+    clock_seconds >= 0,
+    clock_seconds <= 59,
+    !is.na(score_diff),
+    !is.na(pos_team),
+    !is.na(home_team),
+    !is.na(away_team)
+  ) %>%
+  mutate(
+    game_seconds_remaining =
+      (4 - period) * 900 +
+      (clock_minutes * 60) +
+      clock_seconds,
+    
+    home_lead = ifelse(
+      pos_team == home_team,
+      score_diff,
+      -score_diff
+    )
+  ) %>%
+  arrange(season, game_id, desc(game_seconds_remaining)) %>%
+  group_by(season, game_id) %>%
+  mutate(
+    play_duration =
+      lag(game_seconds_remaining, default = 3600) -
+      game_seconds_remaining,
+    
+    play_duration = ifelse(
+      play_duration < 0,
+      0,
+      play_duration
+    )
+  ) %>%
+  ungroup()
+
+game_control_by_game <- pbp_clean %>%
+  group_by(
+    season,
+    game_id,
+    home_team,
+    away_team
+  ) %>%
+  summarize(
+    total_time = sum(play_duration, na.rm = TRUE),
+    home_gc =
+      sum(home_lead * play_duration, na.rm = TRUE) /
+      ifelse(total_time > 0, total_time, 1),
+    away_gc = -home_gc,
+    .groups = "drop"
+  ) %>%
+  filter(total_time >= 3000)
+```
+
+
+### Unadjusted Game Control
+
+```{r}
+gc_team_games <- bind_rows(
+  game_control_by_game %>%
+    select(
+      season,
+      game_id,
+      team = home_team,
+      game_control = home_gc
+    ),
+  
+  game_control_by_game %>%
+    select(
+      season,
+      game_id,
+      team = away_team,
+      game_control = away_gc
+    )
+)
+
+season_game_control <- gc_team_games %>%
+  group_by(season, team) %>%
+  summarize(
+    avg_game_control = mean(game_control, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+### Adjusted Game Control
+
+```{r}
+calc_adj_gc <- function(df) {
+  teams <- unique(c(df$home_team, df$away_team))
+  n_games <- nrow(df)
+  
+  X <- matrix(0, nrow = n_games, ncol = length(teams))
+  colnames(X) <- teams
+  
+  for (i in seq_len(n_games)) {
+    X[i, df$home_team[i]] <- 1
+    X[i, df$away_team[i]] <- -1
+  }
+  
+  fit <- lm(df$home_gc ~ 1 + X)
+  
+  coefs <- coef(fit)
+  
+  gc_vec <- coefs[-1]
+  names(gc_vec) <- gsub("^X", "", names(gc_vec))
+  gc_vec[is.na(gc_vec)] <- 0
+  
+  gc_centered <- gc_vec - mean(gc_vec, na.rm = TRUE)
+  
+  data.frame(
+    team = names(gc_centered),
+    season = df$season[1],
+    Adj_GC = unname(gc_centered),
+    stringsAsFactors = FALSE
+  )
+}
+
+adj_gc_by_season <- game_control_by_game %>%
+  group_split(season) %>%
+  map(calc_adj_gc) %>%
+  bind_rows()
+```
+
+
+### Game Control Correlations
+
+```{r}
+gc_comparison <- season_game_control %>%
+  inner_join(
+    adj_gc_by_season,
+    by = c("season", "team")
+  )
+
+gc_correlation_by_season <- gc_comparison %>%
+  group_by(season) %>%
+  summarize(
+    correlation = cor(
+      avg_game_control,
+      Adj_GC,
+      use = "complete.obs"
+    ),
+    .groups = "drop"
+  )
+
+gc_correlation_all <- cor(
+  gc_comparison$avg_game_control,
+  gc_comparison$Adj_GC,
+  use = "complete.obs"
+)
+
+gc_correlation_by_season
+gc_correlation_all
+```
+
+
+## Average Win Probability
+
+```{r}
+# Calculate game-level average win probability
+awp_by_game <- pbp_raw %>%
+  filter(
+    season_type == "regular",
+    period %in% 1:4,
+    home_team_division == "fbs",
+    away_team_division == "fbs",
+    !is.na(home_wp_before),
+    !is.na(away_wp_before),
+    !is.na(home_team),
+    !is.na(away_team)
+  ) %>%
+  group_by(
+    season,
+    game_id,
+    home_team,
+    away_team
+  ) %>%
+  summarize(
+    home_awp = mean(home_wp_before, na.rm = TRUE),
+    away_awp = mean(away_wp_before, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Reshape into one row per team per game
+awp_team_games <- bind_rows(
+  awp_by_game %>%
+    select(
+      season,
+      game_id,
+      team = home_team,
+      awp = home_awp
+    ),
+  
+  awp_by_game %>%
+    select(
+      season,
+      game_id,
+      team = away_team,
+      awp = away_awp
+    )
+)
+
+# Unadjusted season AWP
+season_awp <- awp_team_games %>%
+  group_by(season, team) %>%
+  summarize(
+    avg_wp = mean(awp, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+### Adjusted AWP
+
+```{r}
+calc_adj_awp <- function(df) {
+  teams <- unique(c(df$home_team, df$away_team))
+  n_games <- nrow(df)
+  
+  X <- matrix(0, nrow = n_games, ncol = length(teams))
+  colnames(X) <- teams
+  
+  for (i in seq_len(n_games)) {
+    X[i, df$home_team[i]] <- 1
+    X[i, df$away_team[i]] <- -1
+  }
+  
+  fit <- lm(df$home_awp ~ 1 + X)
+  
+  coefs <- coef(fit)
+  
+  awp_vec <- coefs[-1]
+  names(awp_vec) <- gsub("^X", "", names(awp_vec))
+  awp_vec[is.na(awp_vec)] <- 0
+  
+  awp_centered <- awp_vec - mean(awp_vec, na.rm = TRUE)
+  
+  data.frame(
+    team = names(awp_centered),
+    season = df$season[1],
+    Adj_AWP = unname(awp_centered),
+    stringsAsFactors = FALSE
+  )
+}
+
+adj_awp_by_season <- awp_by_game %>%
+  group_split(season) %>%
+  map(calc_adj_awp) %>%
+  bind_rows()
+```
+
+
+
+### AWP Correlations
+
+```{r}
+awp_comparison <- season_awp %>%
+  inner_join(
+    adj_awp_by_season,
+    by = c("season", "team")
+  )
+
+awp_correlation_by_season <- awp_comparison %>%
+  group_by(season) %>%
+  summarize(
+    correlation = cor(
+      avg_wp,
+      Adj_AWP,
+      use = "complete.obs"
+    ),
+    .groups = "drop"
+  )
+
+awp_correlation_all <- cor(
+  awp_comparison$avg_wp,
+  awp_comparison$Adj_AWP,
+  use = "complete.obs"
+)
+
+awp_correlation_by_season
+awp_correlation_all
+```
+
+
+
+## Correlation Comparison
+
+```{r}
+correlation_comparison <- gc_correlation_by_season %>%
+  rename(
+    `Game Control` = correlation
+  ) %>%
+  left_join(
+    awp_correlation_by_season %>%
+      rename(
+        AWP = correlation
+      ),
+    by = "season"
+  ) %>%
+  mutate(
+    `Game Control` = round(`Game Control`, 3),
+    AWP = round(AWP, 3)
+  )
+
+all_seasons_row <- tibble(
+  season = "All",
+  `Game Control` = round(gc_correlation_all, 3),
+  AWP = round(awp_correlation_all, 3)
+)
+
+correlation_table <- bind_rows(
+  correlation_comparison %>%
+    mutate(season = as.character(season)),
+  all_seasons_row
+)
+
+kable(
+  correlation_table,
+  format = "markdown",
+  col.names = c(
+    "Season",
+    "Game Control Correlation",
+    "AWP Correlation"
+  ),
+  align = c("c", "r", "r")
+)
+```
+
+
+### Conclusion
+
+I found that both adjusted models were strongly correlated with their unadjusted versions. For all of the seasons combined, the correlation was about 0.866 for Game Control and 0.874 for AWP. Also, the correlations were high in each individual season from 2021 to 2025.
+
+This means that adjusting for opponent strength changed the ratings some, but the overall results stayed somewhat similar. Teams that were rated highly before the adjustment were usually still rated highly after the adjustment. Overall, the AWP model had a slightly higher correlation than Game Control.
