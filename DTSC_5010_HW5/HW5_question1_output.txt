@@ -1,0 +1,11 @@
+ORIGINAL GAME
+        gameId  week  ... homeFinalScore visitorFinalScore
+93  2022101700     6  ...             19                16
+
+[1 rows x 6 columns]
+
+MODIFIED GAME
+        gameId  week  ... homeFinalScore visitorFinalScore
+93  2022101700     6  ...             21                17
+
+[1 rows x 6 columns]
