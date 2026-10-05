@@ -1,7 +1,10 @@
 import pandas as pd
 
-games = pd.read_csv("games.csv")
-games2 = pd.read_csv("games2.csv")
+original_path = "/projects/class/spoa4001_u01/SportsTrackingTransformer/data/BigDataBowl_2024/games.csv"
+modified_path = "/projects/class/spoa4001_u01/SportsTrackingTransformer/data/BigDataBowl_2024/games2.csv"
+
+games = pd.read_csv(original_path)
+games2 = pd.read_csv(modified_path)
 
 # Filter to Week 6 Chargers vs Broncos
 original_game = games[
