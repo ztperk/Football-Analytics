@@ -1,0 +1,24 @@
+
+# Exclude NFL datasets
+data/
+*.pkl
+*.parquet
+
+# Exclude large model files
+models/
+*.ckpt
+
+# Exclude Python environment
+.venv/
+__pycache__/
+
+# Exclude HPC logs and ZIP files
+*.out
+*.zip
+
+# Exclude raw CSV files
+*.csv
+!results/model_comparison.csv
+
+.DS_Store
+
